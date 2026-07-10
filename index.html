@@ -52,9 +52,12 @@
 
   /* video area */
   #videoWrap { position: relative; width: 100%; border-radius: 12px; overflow: hidden; background: #000; }
-  #canvas { display: block; width: 100%; height: auto; touch-action: manipulation; }
+  #canvas { display: block; width: 100%; height: auto; touch-action: none; }
   #frameBar { display: flex; gap: 6px; margin-top: 10px; align-items: center; justify-content: center; }
   #frameBar button { min-width: 52px; font-variant-numeric: tabular-nums; }
+  #zoomBar { display: flex; gap: 6px; margin-top: 8px; align-items: center; justify-content: center; }
+  #zoomBar button { min-width: 44px; }
+  #zoomLabel { color: var(--dim); font-size: 13px; min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; }
   #timeline { width: 100%; margin-top: 10px; accent-color: var(--accent); }
   #frameInfo { text-align: center; color: var(--dim); font-size: 13px; margin-top: 6px; font-variant-numeric: tabular-nums; }
 
@@ -103,6 +106,12 @@
     <button data-step="1">+1</button>
     <button data-step="10">+10</button>
   </div>
+  <div id="zoomBar">
+    <button data-z="out">−</button>
+    <span id="zoomLabel">1.0×</span>
+    <button data-z="in">+</button>
+    <button data-z="reset">전체</button>
+  </div>
   <div id="frameInfo">프레임 —</div>
 </div>
 
@@ -150,6 +159,7 @@
     ① 프레임을 넘겨 릴리스 직후 공이 보이는 프레임에서 <b>A</b>를 누르고 공을 탭 →
     ② +10 정도 프레임을 넘긴 뒤 <b>B</b>를 누르고 공을 탭.
     두 지점 간격이 길수록(10프레임 이상) 오차가 줄어듭니다.
+    <b>두 손가락으로 벌리면 확대</b>되고, 확대 상태에서 드래그하면 화면이 이동합니다 — 확대해서 탭하면 훨씬 정밀해요.
   </div>
 </div>
 
@@ -181,6 +191,7 @@ const state = {
   totalFrames: 0,
   curFrame: 0,
   tapMode: null,       // 'calib1' | 'calib2' | 'ballA' | 'ballB' | null
+  view: { zoom: 1, panX: 0, panY: 0 },  // 확대/이동 (영상 픽셀 좌표 기준)
   calib: { p1: null, p2: null },  // {x, y} (영상 픽셀 좌표)
   ballA: null,         // {x, y, frame}
   ballB: null,
@@ -203,6 +214,8 @@ async function loadVideo(url, name) {
   });
   canvas.width = video.videoWidth;
   canvas.height = video.videoHeight;
+  state.view.zoom = 1; state.view.panX = state.view.panY = 0;
+  clampView();
 
   $('bFile').textContent = name || '로드됨';
   $('bFile').classList.add('done');
@@ -224,31 +237,87 @@ async function loadVideo(url, name) {
 // 재생하면서 프레임 표시 간격의 중앙값을 구한다.
 // 슬로모션 파일은 슬로우 구간에서 보통 30fps 간격으로 재생되므로 그 값이 잡힌다.
 async function detectFrameDuration() {
-  if (!hasRVFC) return 1 / 30;
+  // 1단계: 재생하며 rVFC로 프레임 표시 간격 샘플링 (환경에 따라 실패할 수 있음)
   const deltas = [];
-  video.currentTime = Math.min(video.duration * 0.4, 1); // 앞쪽 램프 구간 회피
-  try { await video.play(); } catch { return 1 / 30; }
-
-  await new Promise(resolve => {
-    let last = null;
-    const deadline = setTimeout(finish, 2500);
-    function finish() { clearTimeout(deadline); resolve(); }
-    function cb(now, meta) {
-      if (last !== null) {
-        const d = meta.mediaTime - last;
-        if (d > 0.0005) deltas.push(d);
-      }
-      last = meta.mediaTime;
-      if (deltas.length >= 24 || video.ended) return finish();
-      video.requestVideoFrameCallback(cb);
+  if (hasRVFC) {
+    video.currentTime = Math.min(video.duration * 0.4, 1); // 앞쪽 램프 구간 회피
+    video.playbackRate = 0.5; // 천천히 재생해 디스플레이가 프레임을 건너뛰지 않게
+    let played = true;
+    try { await video.play(); } catch { played = false; }
+    if (played) {
+      await new Promise(resolve => {
+        let last = null;
+        const deadline = setTimeout(finish, 3500);
+        function finish() { clearTimeout(deadline); resolve(); }
+        function cb(now, meta) {
+          if (last !== null) {
+            const d = meta.mediaTime - last;
+            if (d > 0.0005) deltas.push(d);
+          }
+          last = meta.mediaTime;
+          if (deltas.length >= 24 || video.ended) return finish();
+          video.requestVideoFrameCallback(cb);
+        }
+        video.requestVideoFrameCallback(cb);
+      });
+      video.pause();
     }
-    video.requestVideoFrameCallback(cb);
-  });
-  video.pause();
+    video.playbackRate = 1;
+  }
 
-  if (deltas.length < 4) return 1 / 30;
-  deltas.sort((a, b) => a - b);
-  return deltas[Math.floor(deltas.length / 2)];
+  // 샘플링 실패 시 1/30을 출발점으로 두고 아래 시킹 보정에 맡긴다
+  let d = 1 / 30;
+  if (deltas.length >= 4) {
+    deltas.sort((a, b) => a - b);
+    d = deltas[Math.floor(deltas.length / 2)];
+    const dLow = deltas[Math.floor(deltas.length * 0.15)];
+    if (dLow > 0.001 && d > dLow * 1.5) d = dLow; // 드롭된 프레임(간격 배수)이 중앙값을 밀어올린 경우
+  }
+
+  // 재생 중 프레임 드롭이 있었으면 d가 실제의 배수일 수 있다 (60fps를 30으로 오인).
+  // 시킹은 드롭과 무관하므로, d/2 간격으로 시킹하며 프레임 내용(픽셀)이 매 스텝
+  // 바뀌는지 확인한다. 매번 바뀌면 실제 간격은 d/2 이하 → 절반으로 줄여 재확인.
+  for (let iter = 0; iter < 2; iter++) {
+    const base = Math.min(video.duration * 0.4, 1);
+    let changes = 0, probes = 6;
+    let prev = await frameSig(base);
+    for (let k = 1; k <= probes; k++) {
+      const sig = await frameSig(base + k * d / 2);
+      if (sigDiffers(prev, sig)) changes++;
+      prev = sig;
+    }
+    if (changes >= probes - 1) d = d / 2; // 모든 스텝에서 프레임이 바뀜 → 더 촘촘함
+    else break;
+  }
+
+  const fps = 1 / d;
+  for (const c of [24, 25, 30, 50, 60, 120, 240])
+    if (Math.abs(fps - c) / c < 0.12) return 1 / c; // 표준 fps에 스냅
+  return d;
+}
+
+// t로 시킹한 프레임의 축소 픽셀 시그니처 (rVFC 없이 프레임 구분용)
+const probeCanvas = document.createElement('canvas');
+async function frameSig(t) {
+  await new Promise(res => {
+    const on = () => { video.removeEventListener('seeked', on); res(); };
+    video.addEventListener('seeked', on);
+    video.currentTime = Math.min(t, Math.max(0, video.duration - 0.001));
+  });
+  await new Promise(r => setTimeout(r, 25)); // 디코드 안정화
+  probeCanvas.width = 160; probeCanvas.height = 90;
+  const c = probeCanvas.getContext('2d', { willReadFrequently: true });
+  c.drawImage(video, 0, 0, 160, 90);
+  return c.getImageData(0, 0, 160, 90).data;
+}
+
+function sigDiffers(a, b) {
+  let n = 0;
+  for (let i = 0; i < a.length; i += 4) {
+    if (Math.abs(a[i] - b[i]) > 12 || Math.abs(a[i + 1] - b[i + 1]) > 12 ||
+        Math.abs(a[i + 2] - b[i + 2]) > 12) n++;
+  }
+  return n >= 4;
 }
 
 /* ---------- 프레임 탐색 ---------- */
@@ -281,9 +350,11 @@ function startRenderLoop() {
 
 function draw() {
   if (!video.videoWidth) return;
+  const v = state.view;
+  ctx.setTransform(v.zoom, 0, 0, v.zoom, -v.panX * v.zoom, -v.panY * v.zoom);
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  const s = Math.max(2, canvas.width / 400); // 해상도 비례 선 굵기
+  const s = Math.max(2, canvas.width / 400) / v.zoom; // 화면상 굵기 일정하게 유지
 
   // 캘리브레이션 기준선
   const { p1, p2 } = state.calib;
@@ -302,6 +373,8 @@ function draw() {
     ctx.strokeStyle = 'rgba(255,255,255,.7)'; ctx.lineWidth = s;
     ctx.beginPath(); ctx.moveTo(state.ballA.x, state.ballA.y); ctx.lineTo(state.ballB.x, state.ballB.y); ctx.stroke();
   }
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
 
   $('frameInfo').textContent =
     `프레임 ${state.curFrame} / ${state.totalFrames - 1}` +
@@ -323,13 +396,115 @@ function drawPoint(p, color, s, label) {
   }
 }
 
-/* ---------- 탭 입력 ---------- */
+/* ---------- 확대/이동 ---------- */
 
-canvas.addEventListener('click', e => {
-  if (!state.tapMode) return;
+function toCanvas(e) {
   const r = canvas.getBoundingClientRect();
-  const x = (e.clientX - r.left) * (canvas.width / r.width);
-  const y = (e.clientY - r.top) * (canvas.height / r.height);
+  return { x: (e.clientX - r.left) * (canvas.width / r.width),
+           y: (e.clientY - r.top) * (canvas.height / r.height) };
+}
+
+function clampView() {
+  const v = state.view;
+  v.zoom = Math.min(8, Math.max(1, v.zoom));
+  v.panX = Math.min(canvas.width - canvas.width / v.zoom, Math.max(0, v.panX));
+  v.panY = Math.min(canvas.height - canvas.height / v.zoom, Math.max(0, v.panY));
+  $('zoomLabel').textContent = v.zoom.toFixed(1) + '×';
+}
+
+// (cx, cy)는 캔버스 픽셀 좌표 — 그 아래 영상 지점이 고정된 채 배율 변경
+function zoomAt(cx, cy, newZoom) {
+  const v = state.view;
+  newZoom = Math.min(8, Math.max(1, newZoom));
+  v.panX += cx / v.zoom - cx / newZoom;
+  v.panY += cy / v.zoom - cy / newZoom;
+  v.zoom = newZoom;
+  clampView();
+  draw();
+}
+
+$('zoomBar').addEventListener('click', e => {
+  const b = e.target.closest('button[data-z]');
+  if (!b) return;
+  const v = state.view;
+  if (b.dataset.z === 'reset') { v.zoom = 1; v.panX = v.panY = 0; clampView(); draw(); }
+  else zoomAt(canvas.width / 2, canvas.height / 2, v.zoom * (b.dataset.z === 'in' ? 1.5 : 1 / 1.5));
+});
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const p = toCanvas(e);
+  zoomAt(p.x, p.y, state.view.zoom * Math.pow(1.0015, -e.deltaY));
+}, { passive: false });
+
+/* ---------- 탭/드래그/핀치 입력 ---------- */
+
+const pointers = new Map();
+let pinch = null, dragLast = null, tapCand = null;
+
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  try { canvas.setPointerCapture(e.pointerId); } catch {}
+  pointers.set(e.pointerId, toCanvas(e));
+  if (pointers.size === 1) {
+    tapCand = { id: e.pointerId, cx: e.clientX, cy: e.clientY, t: performance.now() };
+    dragLast = toCanvas(e);
+  } else if (pointers.size === 2) {
+    tapCand = null; dragLast = null;
+    const [a, b] = [...pointers.values()];
+    pinch = {
+      dist: Math.hypot(a.x - b.x, a.y - b.y),
+      midVX: state.view.panX + (a.x + b.x) / 2 / state.view.zoom,
+      midVY: state.view.panY + (a.y + b.y) / 2 / state.view.zoom,
+      zoom: state.view.zoom,
+    };
+  }
+});
+
+canvas.addEventListener('pointermove', e => {
+  if (!pointers.has(e.pointerId)) return;
+  const p = toCanvas(e);
+  pointers.set(e.pointerId, p);
+  if (pinch && pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    const v = state.view;
+    v.zoom = Math.min(8, Math.max(1, pinch.zoom * Math.hypot(a.x - b.x, a.y - b.y) / pinch.dist));
+    v.panX = pinch.midVX - (a.x + b.x) / 2 / v.zoom;
+    v.panY = pinch.midVY - (a.y + b.y) / 2 / v.zoom;
+    clampView();
+    draw();
+  } else if (dragLast && pointers.size === 1) {
+    if (tapCand && Math.hypot(e.clientX - tapCand.cx, e.clientY - tapCand.cy) > 10) tapCand = null;
+    if (!tapCand && state.view.zoom > 1) {
+      state.view.panX -= (p.x - dragLast.x) / state.view.zoom;
+      state.view.panY -= (p.y - dragLast.y) / state.view.zoom;
+      clampView();
+      draw();
+    }
+    dragLast = p;
+  }
+});
+
+canvas.addEventListener('pointerup', e => {
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (pointers.size === 0) dragLast = null;
+  if (tapCand && tapCand.id === e.pointerId) {
+    if (performance.now() - tapCand.t < 700) {
+      const p = toCanvas(e);
+      applyTap(state.view.panX + p.x / state.view.zoom, state.view.panY + p.y / state.view.zoom);
+    }
+    tapCand = null;
+  }
+});
+
+canvas.addEventListener('pointercancel', e => {
+  pointers.delete(e.pointerId);
+  pinch = null; dragLast = null; tapCand = null;
+});
+
+function applyTap(x, y) {
+  if (!state.tapMode) return;
 
   if (state.tapMode === 'calib1') {
     state.calib.p1 = { x, y };
@@ -347,7 +522,7 @@ canvas.addEventListener('click', e => {
   }
   draw();
   computeSpeed();
-});
+}
 
 function setTapMode(mode) {
   state.tapMode = mode;
@@ -481,6 +656,6 @@ $('btnReset').addEventListener('click', () => {
 });
 
 /* 테스트용 내부 API */
-window.__app = { state, loadVideo, computeSpeed, seekToFrame, setCaptureFps, setAutoFps };
+window.__app = { state, loadVideo, computeSpeed, seekToFrame, setCaptureFps, setAutoFps, zoomAt, applyTap };
 })();
 </script>
