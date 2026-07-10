@@ -32,6 +32,7 @@
   .card h2 .badge {
     display: inline-block; background: var(--panel2); color: var(--dim);
     border-radius: 10px; font-size: 11px; padding: 2px 8px; margin-left: 6px; vertical-align: middle;
+    max-width: 55vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   .card h2 .badge.done { background: rgba(61,220,132,.15); color: var(--green); }
   button {
@@ -81,7 +82,7 @@
   input[type=file] { display: none; }
 </style>
 
-<h1>⚾ 구속 측정기 <small>iPhone 슬로모션 영상 분석</small></h1>
+<h1>⚾ 구속 측정기 <small>v1.0.0</small></h1>
 
 <!-- STEP 1: 영상 -->
 <div class="card" id="cardFile">
